@@ -5,6 +5,10 @@
   - Uses ESP32 LEDC PWM for motor speed control.
 */
 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
 // ESP32 motor pins (L298N/L293 style H-bridge)
 // Change only if your wiring differs.
 #define RMF 26  // Right motor forward
@@ -43,6 +47,14 @@ float Kp = 0.22f;
 float Ki = 0.000f;
 float Kd = 2.60f;
 
+// Wi-Fi AP + web settings
+const char *AP_SSID = "Proton ETF";
+const char *AP_PASSWORD = "PROTONETF3";
+
+WebServer server(80);
+Preferences prefs;
+bool wifiApSecured = false;
+
 // Line position scale: 0 ... 4000 (center = 2000)
 const int CENTER_POSITION = 2000;
 
@@ -59,6 +71,14 @@ float error = 0.0f;
 float previousError = 0.0f;
 float integral = 0.0f;
 int lastKnownLinePosition = CENTER_POSITION;
+
+void startAccessPoint();
+void setupWebServer();
+void handleRoot();
+void handleSave();
+void loadSettings();
+void saveSettings();
+String buildHtmlPage(const String &message);
 
 void setup() {
   pinMode(LMF, OUTPUT);
@@ -77,10 +97,14 @@ void setup() {
   ledcAttach(RMS, PWM_FREQ, PWM_RESOLUTION);
 
   Serial.begin(115200);
+  loadSettings();
+  startAccessPoint();
+  setupWebServer();
   stopMotors();
 }
 
 void loop() {
+  server.handleClient();
   updateModeButton();
 
   if (!isDriveMode) {
@@ -146,6 +170,117 @@ bool readLineSensors(int &linePositionOut) {
     linePositionOut = -500;
   }
   return false;
+}
+
+void startAccessPoint() {
+  WiFi.mode(WIFI_AP);
+
+  if (strlen(AP_PASSWORD) >= 8) {
+    wifiApSecured = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  } else {
+    wifiApSecured = false;
+    WiFi.softAP(AP_SSID);
+    Serial.println("[WiFi] AP password is shorter than 8 chars; started OPEN network.");
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("[WiFi] AP SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("[WiFi] AP secure: ");
+  Serial.println(wifiApSecured ? "YES" : "NO");
+  Serial.print("[WiFi] AP IP: ");
+  Serial.println(ip);
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound([]() {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Redirecting...");
+  });
+  server.begin();
+  Serial.println("[Web] Server started on port 80");
+}
+
+void handleRoot() {
+  server.send(200, "text/html", buildHtmlPage(""));
+}
+
+void handleSave() {
+  if (server.hasArg("kp")) Kp = server.arg("kp").toFloat();
+  if (server.hasArg("ki")) Ki = server.arg("ki").toFloat();
+  if (server.hasArg("kd")) Kd = server.arg("kd").toFloat();
+
+  if (server.hasArg("baseSpeed")) baseSpeed = server.arg("baseSpeed").toInt();
+  if (server.hasArg("maxDriveSpeed")) maxDriveSpeed = server.arg("maxDriveSpeed").toInt();
+  if (server.hasArg("minDriveSpeed")) minDriveSpeed = server.arg("minDriveSpeed").toInt();
+
+  integral = 0.0f;
+  previousError = 0.0f;
+
+  saveSettings();
+  server.send(200, "text/html", buildHtmlPage("Saved successfully."));
+}
+
+void loadSettings() {
+  prefs.begin("lf-settings", true);
+  Kp = prefs.getFloat("kp", Kp);
+  Ki = prefs.getFloat("ki", Ki);
+  Kd = prefs.getFloat("kd", Kd);
+  baseSpeed = prefs.getInt("baseSpeed", baseSpeed);
+  maxDriveSpeed = prefs.getInt("maxSpeed", maxDriveSpeed);
+  minDriveSpeed = prefs.getInt("minSpeed", minDriveSpeed);
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("lf-settings", false);
+  prefs.putFloat("kp", Kp);
+  prefs.putFloat("ki", Ki);
+  prefs.putFloat("kd", Kd);
+  prefs.putInt("baseSpeed", baseSpeed);
+  prefs.putInt("maxSpeed", maxDriveSpeed);
+  prefs.putInt("minSpeed", minDriveSpeed);
+  prefs.end();
+}
+
+String buildHtmlPage(const String &message) {
+  String html;
+  html.reserve(2400);
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>LineFollower PID Setup</title>";
+  html += "<style>body{font-family:Arial,sans-serif;margin:24px;background:#f4f6f8;color:#1b1f24;}";
+  html += ".card{max-width:520px;margin:auto;background:#fff;padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,.08);}";
+  html += "h2{margin-top:0;}label{display:block;margin:10px 0 4px;}input{width:100%;padding:10px;font-size:16px;box-sizing:border-box;}";
+  html += "button{margin-top:14px;padding:10px 14px;font-size:16px;cursor:pointer;}";
+  html += ".ok{color:#0b7a24;font-weight:bold;margin-bottom:8px;} .meta{font-size:13px;color:#4a5560;margin-bottom:10px;}";
+  html += "</style></head><body><div class='card'>";
+  html += "<h2>ESP32 PID and Speed Settings</h2>";
+
+  if (message.length() > 0) {
+    html += "<div class='ok'>" + message + "</div>";
+  }
+
+  html += "<div class='meta'>SSID: ";
+  html += AP_SSID;
+  html += " | AP IP: ";
+  html += WiFi.softAPIP().toString();
+  html += "</div>";
+
+  html += "<form method='POST' action='/save'>";
+  html += "<label>Kp</label><input type='text' name='kp' value='" + String(Kp, 6) + "'>";
+  html += "<label>Ki</label><input type='text' name='ki' value='" + String(Ki, 6) + "'>";
+  html += "<label>Kd</label><input type='text' name='kd' value='" + String(Kd, 6) + "'>";
+
+  html += "<label>baseSpeed</label><input type='text' name='baseSpeed' value='" + String(baseSpeed) + "'>";
+  html += "<label>maxDriveSpeed</label><input type='text' name='maxDriveSpeed' value='" + String(maxDriveSpeed) + "'>";
+  html += "<label>minDriveSpeed</label><input type='text' name='minDriveSpeed' value='" + String(minDriveSpeed) + "'>";
+
+  html += "<button type='submit'>Save</button></form>";
+  html += "</div></body></html>";
+  return html;
 }
 
 void followLineStep() {
