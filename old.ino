@@ -7,7 +7,6 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ArduinoOTA.h>
 #include <Preferences.h>
 
 // ESP32 motor pins (L298N/L293 style H-bridge)
@@ -40,29 +39,25 @@ const bool BLACK_IS_HIGH = true;
 const int MAX_SPEED = 255;
 int baseSpeed = 220;
 int maxDriveSpeed = 255;
-int minDriveSpeed = 0;
+int minDriveSpeed = -170;
 
 const int PWM_FREQ = 20000;
 const int PWM_RESOLUTION = 8;
-float Kp = 0.18f;
+float Kp = 0.22f;
 float Ki = 0.000f;
-float Kd = 1.20f;
+float Kd = 2.60f;
 
 // Left motor speed multiplier relative to right motor speed.
 // 1.00 = no compensation, >1.00 boosts left motor, <1.00 reduces left motor.
-float leftRightRatio = 1.03f;
+float leftRightRatio = 1.00f;
 
 // Wi-Fi AP + web settings
 const char *AP_SSID = "Proton ETF";
 const char *AP_PASSWORD = "PROTONETF3";
-const char *OTA_HOSTNAME = "LineFollower26";
-const char *OTA_PASSWORD = "PROTONETF3";
 
 WebServer server(80);
 Preferences prefs;
 bool wifiApSecured = false;
-String telemetryLine = "Robot spreman.";
-unsigned long telemetrySeq = 0;
 
 // Line position scale: 0 ... 4000 (center = 2000)
 const int CENTER_POSITION = 2000;
@@ -71,7 +66,6 @@ int sensorRaw[SENSOR_COUNT];
 byte sensorDigital[SENSOR_COUNT];
 
 bool isDriveMode = false;
-bool isMaxSpeedTestMode = false;
 bool lastButtonRead = HIGH;
 bool buttonStableState = HIGH;
 unsigned long lastDebounceTime = 0;
@@ -83,17 +77,12 @@ float integral = 0.0f;
 int lastKnownLinePosition = CENTER_POSITION;
 
 void startAccessPoint();
-void setupOTA();
 void setupWebServer();
 void handleRoot();
 void handleSave();
 void handleSetMode();
-void handleTelemetry();
 void loadSettings();
 void saveSettings();
-void publishTelemetry(const String &turnLabel, const String &activeSensors, int linePosition, bool lineFound, int leftSpeed, int rightSpeed);
-String buildActiveSensorList();
-String classifyTurnLabel(int linePosition, bool lineFound);
 String buildHtmlPage(const String &message);
 
 void setup() {
@@ -113,44 +102,17 @@ void setup() {
   ledcAttach(RMS, PWM_FREQ, PWM_RESOLUTION);
 
   Serial.begin(115200);
-
-  // Always boot in idle mode until an explicit start command is received.
-  isDriveMode = false;
-  isMaxSpeedTestMode = false;
-
-  // Initialize button debounce state from real pin level to avoid false toggles on boot.
-  lastButtonRead = digitalRead(BTN_MODE);
-  buttonStableState = lastButtonRead;
-  lastDebounceTime = millis();
-
   loadSettings();
   startAccessPoint();
-  setupOTA();
   setupWebServer();
   stopMotors();
-  publishTelemetry("idle", "nijedan", CENTER_POSITION, false, 0, 0);
 }
 
 void loop() {
-  ArduinoOTA.handle();
   server.handleClient();
   updateModeButton();
 
   if (!isDriveMode) {
-    if (!isMaxSpeedTestMode) {
-      stopMotors();
-      digitalWrite(LED_STATUS, LOW);
-      return;
-    }
-
-    int testSpeed = constrain(maxDriveSpeed, 0, MAX_SPEED);
-    setMotorSpeeds(testSpeed, testSpeed);
-    digitalWrite(LED_STATUS, HIGH);
-    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, testSpeed, testSpeed);
-    return;
-  }
-
-  if (isMaxSpeedTestMode) {
     stopMotors();
     digitalWrite(LED_STATUS, LOW);
     return;
@@ -173,22 +135,9 @@ void updateModeButton() {
 
     // Toggle mode on press (LOW because INPUT_PULLUP)
     if (buttonStableState == LOW) {
-      if (isMaxSpeedTestMode) {
-        isMaxSpeedTestMode = false;
-        isDriveMode = false;
-        stopMotors();
-        publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
-        return;
-      }
-
       isDriveMode = !isDriveMode;
       if (!isDriveMode) {
         stopMotors();
-        publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
-      } else {
-        integral = 0.0f;
-        previousError = 0.0f;
-        publishTelemetry("drive mode", "nijedan", CENTER_POSITION, true, 0, 0);
       }
     }
   }
@@ -248,38 +197,10 @@ void startAccessPoint() {
   Serial.println(ip);
 }
 
-void setupOTA() {
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-
-  ArduinoOTA.onStart([]() {
-    stopMotors();
-    Serial.println("[OTA] Start");
-  });
-
-  ArduinoOTA.onEnd([]() {
-    Serial.println("[OTA] End");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("[OTA] Progress: %u%%\r", (progress * 100U) / total);
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("[OTA] Error[%u]\n", error);
-  });
-
-  ArduinoOTA.begin();
-  Serial.println("[OTA] Ready");
-  Serial.print("[OTA] Hostname: ");
-  Serial.println(OTA_HOSTNAME);
-}
-
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/mode", HTTP_POST, handleSetMode);
-  server.on("/telemetry", HTTP_GET, handleTelemetry);
   server.onNotFound([]() {
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Redirecting...");
@@ -296,36 +217,17 @@ void handleSetMode() {
   if (server.hasArg("drive")) {
     String modeArg = server.arg("drive");
     modeArg.toLowerCase();
-    if (modeArg == "2" || modeArg == "max" || modeArg == "test") {
-      isMaxSpeedTestMode = true;
-      isDriveMode = false;
-    } else {
-      isDriveMode = (modeArg == "1" || modeArg == "on" || modeArg == "true");
-      isMaxSpeedTestMode = false;
-    }
+    isDriveMode = (modeArg == "1" || modeArg == "on" || modeArg == "true");
   }
 
-  if (isMaxSpeedTestMode) {
-    int testSpeed = constrain(maxDriveSpeed, 0, MAX_SPEED);
-    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, testSpeed, testSpeed);
-  } else if (!isDriveMode) {
+  if (!isDriveMode) {
     stopMotors();
-    publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
-  } else {
-    publishTelemetry("drive mode", "nijedan", CENTER_POSITION, true, 0, 0);
   }
 
   integral = 0.0f;
   previousError = 0.0f;
 
-  String modeMessage = "Drive mode disabled.";
-  if (isMaxSpeedTestMode) {
-    modeMessage = "MAX SPEED test mode enabled.";
-  } else if (isDriveMode) {
-    modeMessage = "Drive mode enabled.";
-  }
-
-  server.send(200, "text/html", buildHtmlPage(modeMessage));
+  server.send(200, "text/html", buildHtmlPage(isDriveMode ? "Drive mode enabled." : "Drive mode disabled."));
 }
 
 void handleSave() {
@@ -349,10 +251,6 @@ void handleSave() {
   server.send(200, "text/html", buildHtmlPage("Saved successfully."));
 }
 
-void handleTelemetry() {
-  server.send(200, "text/plain", String(telemetrySeq) + "|" + telemetryLine);
-}
-
 void loadSettings() {
   prefs.begin("lf-settings", true);
   Kp = prefs.getFloat("kp", Kp);
@@ -363,15 +261,6 @@ void loadSettings() {
   maxDriveSpeed = prefs.getInt("maxSpeed", maxDriveSpeed);
   minDriveSpeed = prefs.getInt("minSpeed", minDriveSpeed);
   prefs.end();
-
-  // Keep the loaded profile inside a fast-but-stable tuning window.
-  Kp = constrain(Kp, 0.14f, 0.22f);
-  Ki = constrain(Ki, 0.0f, 0.0010f);
-  Kd = constrain(Kd, 0.80f, 1.60f);
-  leftRightRatio = constrain(leftRightRatio, 0.97f, 1.06f);
-  baseSpeed = constrain(baseSpeed, 220, 240);
-  maxDriveSpeed = constrain(maxDriveSpeed, 240, 255);
-  minDriveSpeed = constrain(minDriveSpeed, 0, 30);
 }
 
 void saveSettings() {
@@ -388,7 +277,7 @@ void saveSettings() {
 
 String buildHtmlPage(const String &message) {
   String html;
-  html.reserve(4200);
+  html.reserve(2400);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>LineFollower PID Setup</title>";
@@ -401,10 +290,6 @@ String buildHtmlPage(const String &message) {
   html += ".controls form{margin:0;}";
   html += ".btn-drive{background:#0b7a24;color:#fff;border:0;border-radius:8px;}";
   html += ".btn-stop{background:#b42318;color:#fff;border:0;border-radius:8px;}";
-  html += ".btn-max{background:#1f6feb;color:#fff;border:0;border-radius:8px;}";
-  html += ".console{background:#0d1117;color:#8bffb0;border-radius:10px;padding:12px;height:190px;overflow:auto;";
-  html += "font-family:Consolas,monospace;font-size:13px;line-height:1.45;white-space:pre-wrap;border:1px solid #1f2937;margin:10px 0 16px;}";
-  html += ".console .line{margin:0 0 4px;}";
   html += "</style></head><body><div class='card'>";
   html += "<h2>ESP32 PID and Speed Settings</h2>";
 
@@ -417,23 +302,13 @@ String buildHtmlPage(const String &message) {
   html += " | AP IP: ";
   html += WiFi.softAPIP().toString();
   html += " | Mode: ";
-  html += isMaxSpeedTestMode ? "MAX TEST" : (isDriveMode ? "DRIVE" : "STOP");
+  html += isDriveMode ? "DRIVE" : "STOP";
   html += "</div>";
-
-  html += "<div class='meta'>OTA hostname: ";
-  html += OTA_HOSTNAME;
-  html += " | OTA port: 3232</div>";
 
   html += "<div class='controls'>";
   html += "<form method='POST' action='/mode'><input type='hidden' name='drive' value='1'><button class='btn-drive' type='submit'>Start Robot</button></form>";
-  html += "<form method='POST' action='/mode'><input type='hidden' name='drive' value='max'><button class='btn-max' type='submit'>MAX SPEED TEST</button></form>";
   html += "<form method='POST' action='/mode'><input type='hidden' name='drive' value='0'><button class='btn-stop' type='submit'>Stop Robot</button></form>";
   html += "</div>";
-
-  html += "<h3>Web konzola</h3><div id='console' class='console'></div>";
-  html += "<script>let lastSeq=-1;const box=document.getElementById('console');";
-  html += "function addLine(text){const row=document.createElement('div');row.className='line';row.textContent=text;box.appendChild(row);box.scrollTop=box.scrollHeight;}";
-  html += "function pollTelemetry(){fetch('/telemetry',{cache:'no-store'}).then(r=>r.text()).then(t=>{const split=t.indexOf('|');if(split<0)return;const seq=parseInt(t.slice(0,split),10);const msg=t.slice(split+1);if(!Number.isNaN(seq)&&seq!==lastSeq){lastSeq=seq;addLine(msg);}}).catch(()=>{});}setInterval(pollTelemetry,250);pollTelemetry();</script>";
 
   html += "<form method='POST' action='/save'>";
   html += "<label>Kp</label><input type='text' name='kp' value='" + String(Kp, 6) + "'>";
@@ -485,10 +360,6 @@ void followLineStep() {
   rightSpeed = constrain(rightSpeed, minDriveSpeed, maxDriveSpeed);
 
   setMotorSpeeds(leftSpeed, rightSpeed);
-
-  String turnLabel = classifyTurnLabel(linePosition, lineFound);
-  String activeSensors = buildActiveSensorList();
-  publishTelemetry(turnLabel, activeSensors, linePosition, lineFound, leftSpeed, rightSpeed);
 }
 
 void setMotorSpeeds(int left, int right) {
@@ -523,52 +394,4 @@ void stopMotors() {
   digitalWrite(LMB, LOW);
   digitalWrite(RMF, LOW);
   digitalWrite(RMB, LOW);
-}
-
-void publishTelemetry(const String &turnLabel, const String &activeSensors, int linePosition, bool lineFound, int leftSpeed, int rightSpeed) {
-  telemetrySeq++;
-  telemetryLine = String("#") + String(telemetrySeq) + " " + turnLabel + " | senzori: " + activeSensors +
-                  " | pozicija: " + String(linePosition) +
-                  " | levo: " + String(leftSpeed) +
-                  " | desno: " + String(rightSpeed) +
-                  (lineFound ? " | linija: DETECTED" : " | linija: LOST");
-}
-
-String buildActiveSensorList() {
-  static const char *sensorNames[SENSOR_COUNT] = {
-    "ostro-levo",
-    "levo",
-    "pravo",
-    "desno",
-    "ostro-desno"
-  };
-
-  String result;
-  for (byte i = 0; i < SENSOR_COUNT; i++) {
-    if (sensorDigital[i]) {
-      if (result.length() > 0) {
-        result += ", ";
-      }
-      result += sensorNames[i];
-    }
-  }
-
-  if (result.length() == 0) {
-    result = "nijedan";
-  }
-
-  return result;
-}
-
-String classifyTurnLabel(int linePosition, bool lineFound) {
-  if (!lineFound) {
-    return "linija izgubljena";
-  }
-
-  int offset = linePosition - CENTER_POSITION;
-  if (offset <= -1200) return "ostro-levo";
-  if (offset <= -400) return "levo";
-  if (offset < 400) return "pravo";
-  if (offset < 1200) return "desno";
-  return "ostro-desno";
 }
