@@ -47,6 +47,10 @@ float Kp = 0.22f;
 float Ki = 0.000f;
 float Kd = 2.60f;
 
+// Left motor speed multiplier relative to right motor speed.
+// 1.00 = no compensation, >1.00 boosts left motor, <1.00 reduces left motor.
+float leftRightRatio = 1.00f;
+
 // Wi-Fi AP + web settings
 const char *AP_SSID = "Proton ETF";
 const char *AP_PASSWORD = "PROTONETF3";
@@ -76,6 +80,7 @@ void startAccessPoint();
 void setupWebServer();
 void handleRoot();
 void handleSave();
+void handleSetMode();
 void loadSettings();
 void saveSettings();
 String buildHtmlPage(const String &message);
@@ -195,6 +200,7 @@ void startAccessPoint() {
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/mode", HTTP_POST, handleSetMode);
   server.onNotFound([]() {
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Redirecting...");
@@ -207,10 +213,32 @@ void handleRoot() {
   server.send(200, "text/html", buildHtmlPage(""));
 }
 
+void handleSetMode() {
+  if (server.hasArg("drive")) {
+    String modeArg = server.arg("drive");
+    modeArg.toLowerCase();
+    isDriveMode = (modeArg == "1" || modeArg == "on" || modeArg == "true");
+  }
+
+  if (!isDriveMode) {
+    stopMotors();
+  }
+
+  integral = 0.0f;
+  previousError = 0.0f;
+
+  server.send(200, "text/html", buildHtmlPage(isDriveMode ? "Drive mode enabled." : "Drive mode disabled."));
+}
+
 void handleSave() {
   if (server.hasArg("kp")) Kp = server.arg("kp").toFloat();
   if (server.hasArg("ki")) Ki = server.arg("ki").toFloat();
   if (server.hasArg("kd")) Kd = server.arg("kd").toFloat();
+
+  if (server.hasArg("leftRightRatio")) {
+    leftRightRatio = server.arg("leftRightRatio").toFloat();
+    leftRightRatio = constrain(leftRightRatio, 0.20f, 2.00f);
+  }
 
   if (server.hasArg("baseSpeed")) baseSpeed = server.arg("baseSpeed").toInt();
   if (server.hasArg("maxDriveSpeed")) maxDriveSpeed = server.arg("maxDriveSpeed").toInt();
@@ -228,6 +256,7 @@ void loadSettings() {
   Kp = prefs.getFloat("kp", Kp);
   Ki = prefs.getFloat("ki", Ki);
   Kd = prefs.getFloat("kd", Kd);
+  leftRightRatio = prefs.getFloat("lrRatio", leftRightRatio);
   baseSpeed = prefs.getInt("baseSpeed", baseSpeed);
   maxDriveSpeed = prefs.getInt("maxSpeed", maxDriveSpeed);
   minDriveSpeed = prefs.getInt("minSpeed", minDriveSpeed);
@@ -239,6 +268,7 @@ void saveSettings() {
   prefs.putFloat("kp", Kp);
   prefs.putFloat("ki", Ki);
   prefs.putFloat("kd", Kd);
+  prefs.putFloat("lrRatio", leftRightRatio);
   prefs.putInt("baseSpeed", baseSpeed);
   prefs.putInt("maxSpeed", maxDriveSpeed);
   prefs.putInt("minSpeed", minDriveSpeed);
@@ -256,6 +286,10 @@ String buildHtmlPage(const String &message) {
   html += "h2{margin-top:0;}label{display:block;margin:10px 0 4px;}input{width:100%;padding:10px;font-size:16px;box-sizing:border-box;}";
   html += "button{margin-top:14px;padding:10px 14px;font-size:16px;cursor:pointer;}";
   html += ".ok{color:#0b7a24;font-weight:bold;margin-bottom:8px;} .meta{font-size:13px;color:#4a5560;margin-bottom:10px;}";
+  html += ".controls{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 16px;}";
+  html += ".controls form{margin:0;}";
+  html += ".btn-drive{background:#0b7a24;color:#fff;border:0;border-radius:8px;}";
+  html += ".btn-stop{background:#b42318;color:#fff;border:0;border-radius:8px;}";
   html += "</style></head><body><div class='card'>";
   html += "<h2>ESP32 PID and Speed Settings</h2>";
 
@@ -267,12 +301,20 @@ String buildHtmlPage(const String &message) {
   html += AP_SSID;
   html += " | AP IP: ";
   html += WiFi.softAPIP().toString();
+  html += " | Mode: ";
+  html += isDriveMode ? "DRIVE" : "STOP";
+  html += "</div>";
+
+  html += "<div class='controls'>";
+  html += "<form method='POST' action='/mode'><input type='hidden' name='drive' value='1'><button class='btn-drive' type='submit'>Start Robot</button></form>";
+  html += "<form method='POST' action='/mode'><input type='hidden' name='drive' value='0'><button class='btn-stop' type='submit'>Stop Robot</button></form>";
   html += "</div>";
 
   html += "<form method='POST' action='/save'>";
   html += "<label>Kp</label><input type='text' name='kp' value='" + String(Kp, 6) + "'>";
   html += "<label>Ki</label><input type='text' name='ki' value='" + String(Ki, 6) + "'>";
   html += "<label>Kd</label><input type='text' name='kd' value='" + String(Kd, 6) + "'>";
+  html += "<label>leftRightRatio (left/right)</label><input type='text' name='leftRightRatio' value='" + String(leftRightRatio, 4) + "'>";
 
   html += "<label>baseSpeed</label><input type='text' name='baseSpeed' value='" + String(baseSpeed) + "'>";
   html += "<label>maxDriveSpeed</label><input type='text' name='maxDriveSpeed' value='" + String(maxDriveSpeed) + "'>";
@@ -310,6 +352,9 @@ void followLineStep() {
 
   int leftSpeed = dynamicBase + (int)correction;
   int rightSpeed = dynamicBase - (int)correction;
+
+  // Software compensation for mechanical mismatch between motors.
+  leftSpeed = (int)((float)leftSpeed * leftRightRatio);
 
   leftSpeed = constrain(leftSpeed, minDriveSpeed, maxDriveSpeed);
   rightSpeed = constrain(rightSpeed, minDriveSpeed, maxDriveSpeed);
