@@ -1,6 +1,6 @@
 /*
-  ESP32 line follower for 5 IR sensors + 2 DC motors + one START/STOP button.
-  - Button toggles robot mode between STOP and DRIVE.
+  ESP32 line follower for 5 IR sensors + 2 DC motors.
+  - Robot mode is controlled from web UI (STOP/DRIVE/MAX TEST).
   - PID/PD control is kept and optimized for speed and stability.
   - Uses ESP32 LEDC PWM for motor speed control.
 */
@@ -19,9 +19,6 @@
 #define RMS 19  // Right motor PWM (LEDC)
 #define LMS 18  // Left motor PWM (LEDC)
 
-// Single toggle button (INPUT_PULLUP)
-#define BTN_MODE 23
-
 // Optional status LED
 #define LED_STATUS 2
 
@@ -38,19 +35,19 @@ const bool BLACK_IS_HIGH = true;
 
 // Speed and PID tuning
 const int MAX_SPEED = 255;
-int baseSpeed = 220;
+int baseSpeed = 255;
 int maxDriveSpeed = 255;
-int minDriveSpeed = 0;
+int minDriveSpeed = -125;
 
 const int PWM_FREQ = 20000;
 const int PWM_RESOLUTION = 8;
-float Kp = 0.18f;
-float Ki = 0.000f;
-float Kd = 1.20f;
+float Kp = 0.15f;
+float Ki = 0.002f;
+float Kd = 1.60f;
 
 // Left motor speed multiplier relative to right motor speed.
 // 1.00 = no compensation, >1.00 boosts left motor, <1.00 reduces left motor.
-float leftRightRatio = 1.03f;
+float leftRightRatio = 0.80f;
 
 // Wi-Fi AP + web settings
 const char *AP_SSID = "Proton ETF";
@@ -72,10 +69,6 @@ byte sensorDigital[SENSOR_COUNT];
 
 bool isDriveMode = false;
 bool isMaxSpeedTestMode = false;
-bool lastButtonRead = HIGH;
-bool buttonStableState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceMs = 35;
 
 float error = 0.0f;
 float previousError = 0.0f;
@@ -104,7 +97,6 @@ void setup() {
   pinMode(LMS, OUTPUT);
   pinMode(RMS, OUTPUT);
 
-  pinMode(BTN_MODE, INPUT_PULLUP);
   pinMode(LED_STATUS, OUTPUT);
 
   analogReadResolution(12);
@@ -118,11 +110,6 @@ void setup() {
   isDriveMode = false;
   isMaxSpeedTestMode = false;
 
-  // Initialize button debounce state from real pin level to avoid false toggles on boot.
-  lastButtonRead = digitalRead(BTN_MODE);
-  buttonStableState = lastButtonRead;
-  lastDebounceTime = millis();
-
   loadSettings();
   startAccessPoint();
   setupOTA();
@@ -134,7 +121,6 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
-  updateModeButton();
 
   if (!isDriveMode) {
     if (!isMaxSpeedTestMode) {
@@ -144,9 +130,11 @@ void loop() {
     }
 
     int testSpeed = constrain(maxDriveSpeed, 0, MAX_SPEED);
-    setMotorSpeeds(testSpeed, testSpeed);
+    int leftTestSpeed = (int)((float)testSpeed * leftRightRatio);
+    leftTestSpeed = constrain(leftTestSpeed, 0, testSpeed);
+    setMotorSpeeds(leftTestSpeed, testSpeed);
     digitalWrite(LED_STATUS, HIGH);
-    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, testSpeed, testSpeed);
+    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, leftTestSpeed, testSpeed);
     return;
   }
 
@@ -158,40 +146,6 @@ void loop() {
 
   digitalWrite(LED_STATUS, HIGH);
   followLineStep();
-}
-
-void updateModeButton() {
-  bool readNow = digitalRead(BTN_MODE);
-
-  if (readNow != lastButtonRead) {
-    lastDebounceTime = millis();
-    lastButtonRead = readNow;
-  }
-
-  if ((millis() - lastDebounceTime) > debounceMs && readNow != buttonStableState) {
-    buttonStableState = readNow;
-
-    // Toggle mode on press (LOW because INPUT_PULLUP)
-    if (buttonStableState == LOW) {
-      if (isMaxSpeedTestMode) {
-        isMaxSpeedTestMode = false;
-        isDriveMode = false;
-        stopMotors();
-        publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
-        return;
-      }
-
-      isDriveMode = !isDriveMode;
-      if (!isDriveMode) {
-        stopMotors();
-        publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
-      } else {
-        integral = 0.0f;
-        previousError = 0.0f;
-        publishTelemetry("drive mode", "nijedan", CENTER_POSITION, true, 0, 0);
-      }
-    }
-  }
 }
 
 bool readLineSensors(int &linePositionOut) {
@@ -307,7 +261,9 @@ void handleSetMode() {
 
   if (isMaxSpeedTestMode) {
     int testSpeed = constrain(maxDriveSpeed, 0, MAX_SPEED);
-    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, testSpeed, testSpeed);
+    int leftTestSpeed = (int)((float)testSpeed * leftRightRatio);
+    leftTestSpeed = constrain(leftTestSpeed, 0, testSpeed);
+    publishTelemetry("max speed test", "nijedan", CENTER_POSITION, true, leftTestSpeed, testSpeed);
   } else if (!isDriveMode) {
     stopMotors();
     publishTelemetry("stop", "nijedan", CENTER_POSITION, false, 0, 0);
@@ -364,14 +320,17 @@ void loadSettings() {
   minDriveSpeed = prefs.getInt("minSpeed", minDriveSpeed);
   prefs.end();
 
-  // Keep the loaded profile inside a fast-but-stable tuning window.
-  Kp = constrain(Kp, 0.14f, 0.22f);
-  Ki = constrain(Ki, 0.0f, 0.0010f);
-  Kd = constrain(Kd, 0.80f, 1.60f);
-  leftRightRatio = constrain(leftRightRatio, 0.97f, 1.06f);
-  baseSpeed = constrain(baseSpeed, 220, 240);
-  maxDriveSpeed = constrain(maxDriveSpeed, 240, 255);
-  minDriveSpeed = constrain(minDriveSpeed, 0, 30);
+  // Keep loaded values in a valid and flexible range.
+  Kp = constrain(Kp, 0.05f, 2.00f);
+  Ki = constrain(Ki, 0.0f, 0.05f);
+  Kd = constrain(Kd, 0.20f, 6.00f);
+  leftRightRatio = constrain(leftRightRatio, 0.20f, 2.00f);
+  baseSpeed = constrain(baseSpeed, 0, MAX_SPEED);
+  maxDriveSpeed = constrain(maxDriveSpeed, 0, MAX_SPEED);
+  minDriveSpeed = constrain(minDriveSpeed, -MAX_SPEED, MAX_SPEED);
+  if (minDriveSpeed > maxDriveSpeed) {
+    minDriveSpeed = maxDriveSpeed;
+  }
 }
 
 void saveSettings() {
